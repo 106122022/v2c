@@ -1,97 +1,108 @@
-# Load environment variables from a .env file
+from __future__ import annotations
 from dotenv import load_dotenv
-
-# Import necessary modules from LiveKit
 from livekit import agents
-from livekit.agents import AgentSession, RoomInputOptions
-from livekit.plugins import noise_cancellation
-from livekit.plugins import google
+from livekit.agents import AgentSession, Agent, RoomInputOptions, WorkerOptions, cli, function_tool, RunContext
+from livekit.plugins import google, noise_cancellation
+from prompts import AGENT_INSTRUCTION, SESSION_INSTRUCTION, LOOKUP_RESERVATION_MESSAGE
+from db_driver import DatabaseDriver
+import enum, logging
 
-# Import instruction prompts and custom Restaurant API
-from prompts import AGENT_INSTRUCTION, SESSION_INSTRUCTION
-from api import RestaurantAPI
-
-# Load the environment variables
 load_dotenv()
+logger = logging.getLogger("user-data")
+logger.setLevel(logging.INFO)
+DB = DatabaseDriver()
 
-# Initialize the restaurant API to handle reservations
-restaurant_api = RestaurantAPI()
+class ReservationDetails(enum.Enum):
+    NAME = "name"
+    PHONE = "phone"
+    DATE = "date"
+    TIME = "time"
+    GUESTS = "guests"
 
-# Define the custom assistant class, inheriting from LiveKit's Agent
-class Assistant(agents.Agent):
+class RestaurantAgent(Agent):
     def __init__(self) -> None:
-        # Initialize the agent with voice and behavior settings
-        super().__init__(
-            instructions=AGENT_INSTRUCTION,
-            llm=google.beta.realtime.RealtimeModel(
-                voice="Aoede",  # Voice used by the assistant
-                temperature=0.8,  # Controls randomness of responses
-            ),
-        )
+        super().__init__(instructions=AGENT_INSTRUCTION)
+        self._reservation: dict[ReservationDetails, str] = {
+            ReservationDetails.NAME: "",
+            ReservationDetails.PHONE: "",
+            ReservationDetails.DATE: "",
+            ReservationDetails.TIME: "",
+            ReservationDetails.GUESTS: ""
+        }
 
-    # Define how the assistant responds to user input
-    async def generate_response(self, session, user_input):
-        # Check if the user wants to create a reservation
-        if "create reservation" in user_input.lower():
-            # Ask for user's name
-            await session.generate_reply(instructions="Sure, I can help with that. Could you please provide your name?")
-            name = await session.wait_for_response()
-            
-            # Ask for phone number
-            await session.generate_reply(instructions="Thank you. Could you please provide your phone number?")
-            phone = await session.wait_for_response()
-            
-            # Ask for reservation date
-            await session.generate_reply(instructions="Thanks. When would you like to make the reservation? (Date)")
-            date = await session.wait_for_response()
-            
-            # Ask for reservation time
-            await session.generate_reply(instructions="What time would you like to visit?")
-            time = await session.wait_for_response()
-            
-            # Ask for guest count
-            await session.generate_reply(instructions="How many guests will be joining you?")
-            guests = await session.wait_for_response()
-            
-            # Call the Restaurant API to create the reservation
-            result = await restaurant_api.create_reservation(
-                name=name,
-                phone=phone,
-                date=date,
-                time=time,
-                guests=int(guests)  # Convert guest input to integer
-            )
-            
-            # Return the result to the user
-            await session.generate_reply(response=result)
-        else:
-            # Handle unrecognized requests
-            await session.generate_reply(response="I'm sorry, I didn't understand your request.")
+    def has_reservation(self):
+        return self._reservation[ReservationDetails.PHONE] != ""
 
-# Entrypoint function to start the session
+    def get_reservation_str(self):
+        return "\n".join(f"{k.value}: {v}" for k, v in self._reservation.items())
+
+    @function_tool()
+    async def lookup_reservation(self, context: RunContext, phone: str) -> str:
+        result = DB.get_reservation_by_phone(phone)
+        if not result:
+            return "Reservation not found"
+        self._reservation = {
+            ReservationDetails.NAME: result["name"],
+            ReservationDetails.PHONE: result["phone"],
+            ReservationDetails.DATE: result["date"],
+            ReservationDetails.TIME: result["time"],
+            ReservationDetails.GUESTS: str(result["guests"]),
+        }
+        return f"Found reservation:\n{self.get_reservation_str()}"
+
+    @function_tool()
+    async def create_reservation(self, context: RunContext, name: str, phone: str, date: str, time: str, guests: int) -> str:
+        logger.info("create reservation - %s, %s, %s, %s, %s", name, phone, date, time, guests)
+        result = DB.create_reservation(name, phone, date, time, guests)
+        self._reservation = {
+            ReservationDetails.NAME: result["name"],
+            ReservationDetails.PHONE: result["phone"],
+            ReservationDetails.DATE: result["date"],
+            ReservationDetails.TIME: result["time"],
+            ReservationDetails.GUESTS: str(result["guests"])
+        }
+        return f"Reservation created:\n{self.get_reservation_str()}"
+
+    @function_tool()
+    async def get_reservation_details(self, context: RunContext) -> str:
+        logger.info("get reservation details")
+        if not self.has_reservation():
+            return "No reservation information available."
+        return f"Current reservation details:\n{self.get_reservation_str()}"
+
 async def entrypoint(ctx: agents.JobContext):
-    # Create a new session for the agent
-    session = AgentSession()
-    
-    # Start the session with video and noise cancellation enabled
+    model = google.beta.realtime.RealtimeModel(
+        instructions=AGENT_INSTRUCTION,
+        temperature=0.7,
+        voice="Aoede",
+    )
+
+    session = AgentSession(llm=model)
+    agent = RestaurantAgent()
+
     await session.start(
         room=ctx.room,
-        agent=Assistant(),
+        agent=agent,
         room_input_options=RoomInputOptions(
-            video_enabled=True,
-            noise_cancellation=noise_cancellation.BVC(),  # Use BVC noise cancellation plugin
+            noise_cancellation=noise_cancellation.BVC()
         ),
     )
-
-    # Connect to the room context
     await ctx.connect()
 
-    # Send the initial session instructions to the user
-    await session.generate_reply(
-        instructions=SESSION_INSTRUCTION,
-    )
+    await session.generate_reply(instructions=SESSION_INSTRUCTION)
 
-# Entry point when the script is run directly
+    @session.on("user_message")
+    def on_user(msg):
+        import asyncio
+        asyncio.create_task(handle_user(msg))
+
+    async def handle_user(msg):
+        if agent.has_reservation():
+            await session.send_user_message(msg.content)
+            await session.generate_reply()
+        else:
+            await session.send_user_message(msg.content)
+            await session.generate_reply(instructions=LOOKUP_RESERVATION_MESSAGE(msg.content))
+
 if __name__ == "__main__":
-    # Run the app with the entrypoint function
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))

@@ -2,7 +2,7 @@
 import logging
 
 # Import database functions for reservation management
-from data_base import create_reservation, find_reservation_by_phone, delete_reservation
+from db_driver import create_reservation, find_reservation_by_phone, delete_reservation
 
 # Set up a logger for this module
 logger = logging.getLogger("restaurant-api")
